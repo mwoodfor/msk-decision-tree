@@ -9,20 +9,30 @@
 #                     minimum the seven columns selected below.
 # Outputs:  decision_tree_msk_ggparty.png  (14 × 9 in, 300 dpi)
 #
-# Dependencies: partykit, ggparty, ggplot2, scales, rpart
+# Plot layout
+#   Root node  : "All Patients" box (orange) — full-sample mean, 95% CI, n
+#   Inner nodes: split variable name only (dark navy)
+#   Edge labels: True / False + full-sample mean, 95% CI, n for that branch
+#   Terminal nodes: removed (stats are already on the edges above them)
+#
+# All counts and statistics use the FULL dataset (df), not just the training
+# split, so marketing sees real member counts for outreach planning.
+#
+# Dependencies: partykit, ggparty, ggplot2, scales, rpart, dplyr
 # =============================================================================
 
 
 # ── Install / load packages ───────────────────────────────────────────────────
-install.packages(c("partykit", "ggparty", "ggplot2", "scales", "rpart"))
+install.packages(c("partykit", "ggparty", "ggplot2", "scales", "rpart", "dplyr"))
 library(partykit)   # Tree objects and node utilities
 library(ggparty)    # ggplot2 extension for decision tree visualisation
 library(ggplot2)    # Core plotting
 library(scales)     # Axis label formatting
 library(rpart)      # Recursive partitioning — fits the regression tree
+library(dplyr)      # Data wrangling
 
 
-# ── Column selection & renaming ───────────────────────────────────────────────
+# ── Column selection & type coercion ─────────────────────────────────────────
 # Narrow df_raw to the outcome and the six binary clinical predictors.
 # Clean names avoid formula-quoting issues in rpart() and downstream code.
 df <- df_raw %>%
@@ -36,17 +46,14 @@ df <- df_raw %>%
     has_acute_care             # Binary: acute care utilisation flag
   ) %>%
   mutate(
-    # risk_score_12m arrives as character in the source data; coerce to numeric
-    # here so rpart(), partykit, and all plot code receive the correct type.
     risk_score_12m = as.numeric(risk_score_12m)
   )
 
-# Sanity check: warn if coercion introduced unexpected NAs (e.g. non-numeric
-# strings like "N/A" or "" present in the source data).
+# Sanity check: warn if coercion introduced unexpected NAs.
 na_count <- sum(is.na(df$risk_score_12m))
 if (na_count > 0)
   warning(sprintf(
-    "%d rows have NA risk_score_12m after coercion — check source data for non-numeric values.",
+    "%d rows have NA risk_score_12m after coercion — check source data.",
     na_count
   ))
 
@@ -62,7 +69,8 @@ label_map <- c(
 
 
 # ── Train / test split ────────────────────────────────────────────────────────
-# Fix seed for reproducible 80/20 split; test set used for out-of-sample eval.
+# 80/20 split; tree is fitted on train only to avoid data leakage.
+# Full dataset (df) is used downstream for all displayed statistics.
 set.seed(42)
 train_idx <- sample(nrow(df), 0.8 * nrow(df))
 train <- df[train_idx, ]
@@ -70,10 +78,6 @@ test  <- df[-train_idx, ]
 
 
 # ── Fit regression tree ───────────────────────────────────────────────────────
-# maxdepth = 4  : caps complexity to four levels, improving interpretability.
-# minsplit  = 30: a node must have >= 30 observations before attempting a split.
-# cp        = 0.005: complexity parameter — splits that don't improve R^2 by at
-#             least 0.5% are not attempted, preventing trivial branches.
 tree_model <- rpart(
   risk_score_12m ~ .,
   data    = train,
@@ -83,9 +87,6 @@ tree_model <- rpart(
 
 
 # ── Prune via the 1-SE rule ───────────────────────────────────────────────────
-# The 1-SE rule selects the simplest tree whose cross-validated error (xerror)
-# is within one standard error of the minimum — a more conservative choice than
-# simply picking the tree with the lowest xerror, reducing risk of overfitting.
 cp_table  <- tree_model$cptable
 min_idx   <- which.min(cp_table[, "xerror"])
 threshold <- cp_table[min_idx, "xerror"] + cp_table[min_idx, "xstd"]
@@ -95,130 +96,167 @@ tree_pruned <- prune(tree_model, cp = best_cp)
 
 
 # ── Convert to partykit format ────────────────────────────────────────────────
-# as.party() wraps the rpart object in the partykit representation required by
-# ggparty for plotting; node data and split information are preserved.
 party_tree <- as.party(tree_pruned)
-
-# as.party() can re-encode the numeric outcome as a factor in party_tree$data.
-# A single coercion on the top-level $data slot fixes it for all nodes at once.
 party_tree$data$risk_score_12m <- as.numeric(as.character(party_tree$data$risk_score_12m))
 
 
-# ── Build the ggparty visualisation ──────────────────────────────────────────
-# Color palette: Blue Cross Blue Shield of Massachusetts brand colors.
-#   Primary Blue  #0057A8 — deep cobalt, dominant brand color
-#   Light Blue    #00A3E0 — bright cyan-blue, used for CTAs and highlights
-#   Orange        #F47920 — warm accent orange, used for buttons and callouts
-#   Dark Navy     #003366 — deep background blue
-node_bg  <- "#003366"   # BCBSMA Dark Navy  — inner node label background
-text_col <- "#FFFFFF"   # White text on dark node labels
+# ── Route the FULL dataset through the pruned tree ────────────────────────────
+# predict(..., type = "node") returns the terminal node ID each full-sample
+# observation is routed to. Combined with the tree structure, this lets us
+# compute accurate member counts at every node for marketing outreach.
+#
+# node_path() walks from the root to each terminal node and collects all
+# ancestor node IDs, so we know which observations pass through each inner node.
+df$node_id <- predict(tree_pruned, newdata = df, type = "node")
 
-# ── add_vars: compute mean, 95% CI bounds, and n for every node ───────────────
-# ggparty's add_vars argument accepts named functions of the form
-# function(data, node). They are evaluated once per node at plot-build time,
-# making the results available as columns inside any aes() call.
-# qt(0.975, df) gives the t critical value for a two-sided 95% CI.
-# The as.numeric(as.character()) coercion is retained as a safety net because
-# as.party() may store risk_score_12m as a factor in per-node $data slots even
-# after the top-level $data patch above.
-p <- ggparty(
-  party_tree,
-  terminal_space = 0.2,
-  add_vars = list(
+# Map rpart terminal node numbers to partykit node IDs.
+# as.party() re-indexes nodes; the partykit terminal IDs are stored in
+# nodeids(party_tree, terminal = TRUE) and correspond 1-to-1 with the sorted
+# unique values returned by rpart's predict(..., type = "node").
+rpart_terminal_ids  <- sort(unique(df$node_id))
+party_terminal_ids  <- sort(nodeids(party_tree, terminal = TRUE))
+node_id_map         <- setNames(party_terminal_ids, as.character(rpart_terminal_ids))
+df$party_node_id    <- node_id_map[as.character(df$node_id)]
 
-    node_mean = function(data, node) {
-      x <- as.numeric(as.character(node$data$risk_score_12m))
-      round(mean(x, na.rm = TRUE), 3)
-    },
+# For each partykit node, collect the set of full-sample row indices that pass
+# through it (terminal nodes: exact assignment; inner nodes: union of all
+# descendant terminal nodes' observations).
+#
+# nodeids(party_tree) returns ALL node IDs (inner + terminal).
+# children_node() is not exported; we walk the tree with kids_node().
+all_node_ids <- nodeids(party_tree)
 
-    node_ci_lo = function(data, node) {
-      x  <- as.numeric(as.character(node$data$risk_score_12m))
-      n  <- sum(!is.na(x))
-      se <- sd(x, na.rm = TRUE) / sqrt(n)
-      round(mean(x, na.rm = TRUE) - qt(0.975, df = n - 1) * se, 3)
-    },
+# Build a lookup: node ID -> vector of row indices in df routed through it.
+node_rows <- lapply(setNames(all_node_ids, all_node_ids), function(nid) {
+  # Get all terminal descendants of this node (includes itself if terminal).
+  desc_terminals <- nodeids(party_tree[[nid]], terminal = TRUE)
+  # Map back to partykit IDs via the subtree's nodeids.
+  # party_tree[[nid]] re-indexes from 1; add (nid - 1) to recover global IDs.
+  # Simpler: just find which party_terminal_ids are descendants by checking
+  # whether their rpart node IDs fall within the subtree.
+  # Most robust approach: use the pre-computed df$party_node_id directly.
+  which(df$party_node_id %in% nodeids(party_tree[[nid]], terminal = TRUE))
+})
 
-    node_ci_hi = function(data, node) {
-      x  <- as.numeric(as.character(node$data$risk_score_12m))
-      n  <- sum(!is.na(x))
-      se <- sd(x, na.rm = TRUE) / sqrt(n)
-      round(mean(x, na.rm = TRUE) + qt(0.975, df = n - 1) * se, 3)
-    },
 
-    node_n = function(data, node) {
-      sum(!is.na(as.numeric(as.character(node$data$risk_score_12m))))
-    }
-
+# ── Helper: compute stats for a vector of row indices ────────────────────────
+node_stats <- function(rows) {
+  x  <- df$risk_score_12m[rows]
+  x  <- x[!is.na(x)]
+  n  <- length(x)
+  m  <- mean(x)
+  se <- sd(x) / sqrt(n)
+  t  <- qt(0.975, df = n - 1)
+  list(
+    mean  = round(m, 3),
+    ci_lo = round(m - t * se, 3),
+    ci_hi = round(m + t * se, 3),
+    n     = n
   )
-) +
+}
+
+# Pre-compute stats for every node keyed by partykit node ID.
+all_stats <- lapply(setNames(all_node_ids, all_node_ids), function(nid) {
+  node_stats(node_rows[[nid]])
+})
+
+# Convenience named vectors for use inside aes() expressions.
+stat_mean  <- sapply(all_stats, `[[`, "mean")
+stat_ci_lo <- sapply(all_stats, `[[`, "ci_lo")
+stat_ci_hi <- sapply(all_stats, `[[`, "ci_hi")
+stat_n     <- sapply(all_stats, `[[`, "n")
+
+
+# ── Full-sample root node annotation ─────────────────────────────────────────
+# Computed from df (all 27,413 members) independently of the tree structure.
+root_x    <- df$risk_score_12m[!is.na(df$risk_score_12m)]
+root_n    <- length(root_x)
+root_mean <- round(mean(root_x), 3)
+root_se   <- sd(root_x) / sqrt(root_n)
+root_t    <- qt(0.975, df = root_n - 1)
+root_ci_lo <- round(root_mean - root_t * root_se, 3)
+root_ci_hi <- round(root_mean + root_t * root_se, 3)
+
+root_label <- paste0(
+  "All Patients\n",
+  "\u03bc = ", root_mean, "  [", root_ci_lo, ", ", root_ci_hi, "]\n",
+  "n = ", formatC(root_n, format = "d", big.mark = ",")
+)
+
+
+# ── Color palette ─────────────────────────────────────────────────────────────
+# BCBSMA brand colors:
+#   Primary Blue  #0057A8   Light Blue  #00A3E0
+#   Orange        #F47920   Dark Navy   #003366
+node_bg   <- "#003366"   # inner split nodes
+root_bg   <- "#F47920"   # root "All Patients" node — distinct orange
+edge_fill <- "#E8F4FB"   # edge label background
+edge_col  <- "#0057A8"   # edge label text
+text_col  <- "#FFFFFF"
+
+
+# ── Build the ggparty visualisation ──────────────────────────────────────────
+p <- ggparty(party_tree, terminal_space = 0.15) +
 
   # ── Tree edges ───────────────────────────────────────────────────────────────
   geom_edge(color = "#00A3E0", linewidth = 0.7) +
 
-  # ── Edge labels: True / False instead of >= 0.5 / < 0.5 ────────────────────
-  # All predictors are binary (0/1). rpart splits them at 0.5, producing the
-  # breaks_label values "< 0.5" (i.e. 0 = False) and ">= 0.5" (i.e. 1 = True).
-  # The ifelse() remaps these to human-readable True/False labels.
+  # ── Edge labels: True/False + full-sample stats for the child node ───────────
+  # Each edge leads to a child node. We look up the child's partykit node ID
+  # using the `id` aesthetic (which ggparty maps to the CHILD node for edges)
+  # and retrieve the pre-computed full-sample stats from the named vectors.
+  #
+  # breaks_label gives "< 0.5" (False) or ">= 0.5" (True) for binary vars.
+  # The multi-line label stacks True/False, then mean [CI], then n.
   geom_edge_label(
     aes(
-      label = ifelse(
-        grepl(">=", breaks_label), "True",
-        ifelse(grepl("<",  breaks_label), "False", breaks_label)
+      label = paste0(
+        ifelse(grepl(">=", breaks_label), "True", "False"), "\n",
+        "\u03bc = ", stat_mean[as.character(id)],
+        "  [", stat_ci_lo[as.character(id)],
+        ", ",  stat_ci_hi[as.character(id)], "]\n",
+        "n = ", formatC(stat_n[as.character(id)], format = "d", big.mark = ",")
       )
     ),
-    color         = "#0057A8",
-    size          = 3.2,
-    fontface      = "bold",
-    fill          = "#E8F4FB",
-    label.padding = unit(0.2, "lines"),
+    color         = edge_col,
+    size          = 2.8,
+    fontface      = "plain",
+    fill          = edge_fill,
+    label.padding = unit(0.35, "lines"),
     label.r       = unit(0.15, "lines")
   ) +
 
-  # ── Inner node labels: variable name + mean (95% CI) + n ────────────────────
-  # geom_node_label()'s line_list argument accepts one aes() per line of text;
-  # line_gpar sets font size, color, and style for each line independently.
-  # The three stats (mean, CI, n) are pre-computed via add_vars above and are
-  # available here by their names as ggparty data columns.
+  # ── Root node: "All Patients" — orange, full-sample stats ───────────────────
+  # The root node is node ID 1. We target it specifically with ids = 1 and
+  # annotate it with the pre-computed root_label string. The orange fill
+  # visually distinguishes it as the "before any split" starting point.
   geom_node_label(
-    ids       = "inner",
-    line_list = list(
-      # Line 1: human-readable variable name from label_map
-      aes(label = ifelse(is.na(splitvar), "", label_map[splitvar])),
-      # Line 2: mean risk score with 95% confidence interval
-      aes(label = paste0("\u03bc = ", node_mean,
-                         "  [", node_ci_lo, ", ", node_ci_hi, "]")),
-      # Line 3: sample size at this node
-      aes(label = paste0("n = ", formatC(node_n, format = "d", big.mark = ",")))
-    ),
-    line_gpar = list(
-      list(size = 10, col = text_col, fontface = "bold"),   # variable name
-      list(size =  8, col = "#A8C8E8", fontface = "plain"), # mean + CI
-      list(size =  8, col = "#A8C8E8", fontface = "plain")  # n
-    ),
-    fill          = node_bg,
-    label.padding = unit(0.45, "lines"),
-    label.r       = unit(0.2,  "lines"),
-    label.col     = node_bg
+    aes(label = root_label),
+    ids           = 1L,
+    color         = text_col,
+    fill          = root_bg,
+    size          = 3.2,
+    fontface      = "bold",
+    label.padding = unit(0.5, "lines"),
+    label.r       = unit(0.2, "lines"),
+    label.col     = root_bg
   ) +
 
-  # ── Terminal node labels: mean (95% CI) + n ──────────────────────────────────
-  # Terminal nodes receive the same stats layout but without a variable name,
-  # styled in BCBSMA light blue on a pale background for visual contrast.
+  # ── Inner (non-root) split nodes: variable name only ────────────────────────
+  # These nodes show only the splitting variable name. Stats are on the edges,
+  # so repeating them here would clutter the plot.
+  # ids = "inner" targets ALL inner nodes including the root; we exclude node 1
+  # by passing the explicit IDs of inner nodes that are not the root.
   geom_node_label(
-    ids       = "terminal",
-    line_list = list(
-      aes(label = paste0("\u03bc = ", node_mean,
-                         "  [", node_ci_lo, ", ", node_ci_hi, "]")),
-      aes(label = paste0("n = ", formatC(node_n, format = "d", big.mark = ",")))
-    ),
-    line_gpar = list(
-      list(size = 8, col = "#0057A8", fontface = "plain"),
-      list(size = 8, col = "#0057A8", fontface = "plain")
-    ),
-    fill          = "#E8F4FB",
-    label.padding = unit(0.4,  "lines"),
-    label.r       = unit(0.15, "lines"),
-    label.col     = "#BDD9EF"
+    aes(label = ifelse(is.na(splitvar), "", label_map[splitvar])),
+    ids           = setdiff(nodeids(party_tree, terminal = FALSE), 1L),
+    color         = text_col,
+    fill          = node_bg,
+    size          = 3.5,
+    fontface      = "bold",
+    label.padding = unit(0.4, "lines"),
+    label.r       = unit(0.2, "lines"),
+    label.col     = node_bg
   ) +
 
   # ── Overall plot theme & titles ───────────────────────────────────────────────
@@ -229,23 +267,27 @@ p <- ggparty(
                                    hjust = 0.5, margin = margin(b = 6)),
     plot.subtitle   = element_text(size = 11, color = "#0057A8",
                                    hjust = 0.5, margin = margin(b = 16)),
-    plot.caption    = element_text(size = 8, color = "#00A3E0", hjust = 1),
+    plot.caption    = element_text(size = 8,  color = "#00A3E0", hjust = 1),
     plot.margin     = margin(20, 20, 20, 20)
   ) +
   labs(
     title    = "Predictors of 12-Month MSK Risk Score",
-    subtitle = "Regression tree \u00b7 each node shows mean risk score (95% CI) and sample size",
-    caption  = "Pruned via 1-SE rule \u00b7 trained on 80% holdout"
+    subtitle = paste0(
+      "Regression tree \u00b7 edge labels show full-sample mean (95% CI) and member count",
+      "\n",
+      "Orange root = all ", formatC(root_n, format = "d", big.mark = ","),
+      " members \u00b7 navy nodes = split variable"
+    ),
+    caption  = "Tree fitted on 80% training split, pruned via 1-SE rule \u00b7 statistics from full sample (n = 27,413)"
   )
 
 
 # ── Export ────────────────────────────────────────────────────────────────────
-# Output at 300 dpi for print-quality use in reports or presentations.
 ggsave(
   "decision_tree_msk_ggparty.png",
   plot   = p,
-  width  = 14,
-  height = 9,
+  width  = 16,
+  height = 10,
   dpi    = 300,
   bg     = "#F0F8FF"
 )
