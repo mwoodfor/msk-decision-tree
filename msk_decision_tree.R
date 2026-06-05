@@ -87,25 +87,46 @@ tree_pruned <- prune(tree_model, cp = best_cp)
 party_tree <- as.party(tree_pruned)
 
 
+# ── Pre-compute terminal node means ──────────────────────────────────────────
+# nodeapply() cannot be called inside aes() because `id` is a ggplot aesthetic
+# variable, not an R object available at expression-build time. Instead, build
+# a named numeric vector keyed by node ID here, then look it up inside aes()
+# using the vectorised `node_means[as.character(id)]` pattern.
+terminal_ids <- nodeids(party_tree, terminal = TRUE)
+node_means   <- setNames(
+  sapply(terminal_ids, function(i)
+    mean(party_tree[[i]]$data$risk_score_12m, na.rm = TRUE)
+  ),
+  as.character(terminal_ids)
+)
+
+
 # ── Build the ggparty visualisation ──────────────────────────────────────────
-# Color palette: teal (low risk) → coral (high risk) gradient on histograms.
-risk_low  <- "#2a9d8f"   # Low-risk end of histogram fill gradient
-risk_high <- "#e76f51"   # High-risk end of histogram fill gradient
-node_bg   <- "#1e293b"   # Dark navy background for inner (split) node labels
-text_col  <- "#f8fafc"   # Near-white text on dark node labels
+# Color palette: Blue Cross Blue Shield of Massachusetts brand colors.
+#   Primary Blue  #0057A8 — deep cobalt, dominant brand color
+#   Light Blue    #00A3E0 — bright cyan-blue, used for CTAs and highlights
+#   Orange        #F47920 — warm accent orange, used for buttons and callouts
+#   Dark Navy     #003366 — deep background blue
+#
+# Histogram gradient runs BCBSMA light blue (low risk) → BCBSMA orange (high risk).
+# Inner node labels use the dark navy background with white text.
+risk_low  <- "#00A3E0"   # BCBSMA Light Blue — low-risk end of histogram gradient
+risk_high <- "#F47920"   # BCBSMA Orange     — high-risk end of histogram gradient
+node_bg   <- "#003366"   # BCBSMA Dark Navy  — inner node label background
+text_col  <- "#FFFFFF"   # White text on dark node labels
 
 p <- ggparty(party_tree, terminal_space = 0.35) +
 
   # ── Tree edges ─────────────────────────────────────────────────────────────
-  geom_edge(color = "#94a3b8", size = 0.7) +
+  geom_edge(color = "#00A3E0", linewidth = 0.7) +
 
   # Edge labels: show the Yes/No or factor-level break values at each branch.
   geom_edge_label(
     aes(label = breaks_label),
-    color         = "#334155",
+    color         = "#0057A8",
     size          = 3.2,
     fontface      = "bold",
-    fill          = "#e2e8f0",
+    fill          = "#E8F4FB",
     label.padding = unit(0.2, "lines"),
     label.r       = unit(0.15, "lines")
   ) +
@@ -119,8 +140,7 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
     size          = 3.5,
     fontface      = "bold",
     label.padding = unit(0.4, "lines"),
-    label.r       = unit(0.2, "lines"),
-    label.colour  = "#475569"
+    label.r       = unit(0.2, "lines")
   ) +
 
   # ── Terminal node plots: mini histogram of risk score distribution ──────────
@@ -130,9 +150,9 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
     gglist = list(
       geom_histogram(
         aes(x = risk_score_12m, fill = after_stat(x)),
-        bins  = 15,
-        color = "white",
-        size  = 0.2
+        bins      = 15,
+        color     = "white",
+        linewidth = 0.2
       ),
       scale_fill_gradient(low = risk_low, high = risk_high, guide = "none"),
       scale_x_continuous(labels = label_number(accuracy = 0.1)),
@@ -142,7 +162,7 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
         panel.grid  = element_blank(),
         axis.title  = element_blank(),
         axis.text.y = element_blank(),
-        axis.text.x = element_text(size = 6, color = "#64748b"),
+        axis.text.x = element_text(size = 6, color = "#0057A8"),
         plot.margin = margin(2, 2, 2, 2)
       )
     ),
@@ -152,35 +172,32 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
   ) +
 
   # ── Terminal node labels: mean risk score (μ) for each leaf ────────────────
-  # nodeapply() extracts the mean risk score from each terminal node's data
-  # subset, and the result is formatted as "μ = X.XX" below the histogram.
+  # node_means is a named vector (keyed by node ID as character) pre-computed
+  # above. Looking it up with node_means[as.character(id)] is safe inside aes()
+  # because the entire vector is available in the enclosing environment.
   geom_node_label(
     aes(
-      label = paste0("μ = ", round(nodeapply(party_tree,
-        ids = nodeids(party_tree, terminal = TRUE),
-        FUN = function(n) mean(n$data$risk_score_12m, na.rm = TRUE)
-      )[[as.character(id)]], 2))
+      label = paste0("\u03bc = ", round(node_means[as.character(id)], 2))
     ),
     ids           = "terminal",
-    color         = "#1e293b",
-    fill          = "#f1f5f9",
+    color         = "#0057A8",
+    fill          = "#E8F4FB",
     size          = 3,
     fontface      = "italic",
     nudge_y       = -0.06,
     label.padding = unit(0.25, "lines"),
-    label.r       = unit(0.15, "lines"),
-    label.colour  = "#cbd5e1"
+    label.r       = unit(0.15, "lines")
   ) +
 
   # ── Overall plot theme & titles ────────────────────────────────────────────
   theme_void(base_family = "sans") +
   theme(
-    plot.background = element_rect(fill = "#f8fafc", color = NA),
-    plot.title      = element_text(size = 18, face = "bold", color = "#0f172a",
+    plot.background = element_rect(fill = "#F0F8FF", color = NA),
+    plot.title      = element_text(size = 18, face = "bold", color = "#003366",
                                    hjust = 0.5, margin = margin(b = 6)),
-    plot.subtitle   = element_text(size = 11, color = "#475569",
+    plot.subtitle   = element_text(size = 11, color = "#0057A8",
                                    hjust = 0.5, margin = margin(b = 16)),
-    plot.caption    = element_text(size = 8, color = "#94a3b8", hjust = 1),
+    plot.caption    = element_text(size = 8, color = "#00A3E0", hjust = 1),
     plot.margin     = margin(20, 20, 20, 20)
   ) +
   labs(
@@ -198,6 +215,6 @@ ggsave(
   width  = 14,
   height = 9,
   dpi    = 300,
-  bg     = "#f8fafc"
+  bg     = "#F0F8FF"
 )
 cat("Saved: decision_tree_msk_ggparty.png\n")
