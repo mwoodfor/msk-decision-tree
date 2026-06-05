@@ -35,7 +35,23 @@ df <- df_raw %>%
     has_inj,                  # Binary: injection utilisation flag
     has_lifestyle_comorbidity,# Binary: lifestyle-related comorbidity present
     has_acute_care            # Binary: acute care utilisation flag
+  ) %>%
+  mutate(
+    # risk_score_12m arrives as character in the source data; coerce to numeric
+    # here so rpart(), partykit, and all plot code receive the correct type.
+    # The as.numeric(as.character(...)) guards downstream are kept as a safety
+    # net in case the source type changes again, but this is now the fix.
+    risk_score_12m = as.numeric(risk_score_12m)
   )
+
+# Sanity check: warn if coercion introduced unexpected NAs (e.g. non-numeric
+# strings like "N/A" or "" present in the source data).
+na_count <- sum(is.na(df$risk_score_12m))
+if (na_count > 0)
+  warning(sprintf(
+    "%d rows have NA risk_score_12m after coercion — check source data for non-numeric values.",
+    na_count
+  ))
 
 # Human-readable labels used only in plot annotations (not in the model).
 label_map <- c(
