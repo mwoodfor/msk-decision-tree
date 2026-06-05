@@ -98,7 +98,11 @@ party_tree <- as.party(tree_pruned)
 terminal_ids <- nodeids(party_tree, terminal = TRUE)
 node_means   <- setNames(
   sapply(terminal_ids, function(i)
-    mean(as.numeric(party_tree[[i]]$data$risk_score_12m), na.rm = TRUE)
+    # as.numeric(as.character()) is required: as.party() stores the outcome as
+    # a factor in node$data. Plain as.numeric() returns factor level codes
+    # (integers like 6051), not the original probability values. Converting
+    # factor → character → numeric recovers the true 0–1 probability.
+    mean(as.numeric(as.character(party_tree[[i]]$data$risk_score_12m)), na.rm = TRUE)
   ),
   as.character(terminal_ids)
 )
@@ -135,8 +139,12 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
   ) +
 
   # ── Inner node labels: show the splitting variable name ────────────────────
+  # label_map translates raw column names (e.g. "has_pt") to readable labels
+  # (e.g. "Physical Therapy"). ifelse guards nodes where splitvar is NA (roots
+  # of single-node trees) though in practice all inner nodes have a splitvar.
   geom_node_label(
-    aes(label = splitvar),
+    aes(label = ifelse(is.na(splitvar), "",
+                       label_map[splitvar])),
     ids           = "inner",
     color         = text_col,
     fill          = node_bg,
@@ -152,15 +160,15 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
   geom_node_plot(
     gglist = list(
       geom_histogram(
-        # as.numeric() guards against risk_score_12m being coerced to a factor
-        # when rpart node data is converted to the partykit representation.
-        aes(x = as.numeric(risk_score_12m), fill = after_stat(x)),
+        # as.numeric(as.character()) is required — see node_means comment above.
+        # Plain as.numeric() on a factor returns level codes, not probabilities.
+        aes(x = as.numeric(as.character(risk_score_12m)), fill = after_stat(x)),
         bins      = 15,
         color     = "white",
         linewidth = 0.2
       ),
       scale_fill_gradient(low = risk_low, high = risk_high, guide = "none"),
-      scale_x_continuous(labels = label_number(accuracy = 0.1)),
+      scale_x_continuous(limits = c(0, 1), labels = label_number(accuracy = 0.01)),
       scale_y_continuous(labels = NULL),
       theme_minimal(base_family = "sans"),
       theme(
@@ -182,14 +190,14 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
   # because the entire vector is available in the enclosing environment.
   geom_node_label(
     aes(
-      label = paste0("\u03bc = ", round(node_means[as.character(id)], 2))
+      label = paste0("\u03bc = ", round(node_means[as.character(id)], 3))
     ),
     ids           = "terminal",
     color         = "#0057A8",
     fill          = "#E8F4FB",
     size          = 3,
     fontface      = "italic",
-    nudge_y       = -0.06,
+    nudge_y       = 0.06,    # positive = above the histogram, not overlapping it
     label.padding = unit(0.25, "lines"),
     label.r       = unit(0.15, "lines")
   ) +
