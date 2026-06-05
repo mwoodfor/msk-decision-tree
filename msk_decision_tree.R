@@ -13,34 +13,30 @@
 #   Root node    : "All Patients" box (orange) — full-sample mean, 95% CI, n
 #   Inner nodes  : split variable name only (dark navy)
 #   Edge labels  : True / False + full-sample mean, 95% CI, n for child branch
-#   Terminal nodes: invisible (stats are already on the incoming edge labels)
+#   Terminal nodes: invisible
 #
 # All counts and statistics use the FULL dataset (df), not just the training
 # split, so marketing sees real member counts for outreach planning.
 #
-# Key implementation note
-#   add_vars in ggparty() injects per-node values into the NODE data frame,
-#   which is available in geom_node_label() but NOT in geom_edge_label().
-#   Edge labels reference the child node's id, but add_vars columns are only
-#   accessible at node-draw time, not edge-draw time.
-#   Solution: pre-compute all display strings as named character vectors keyed
-#   by partykit node ID *outside* the plot call, then look them up inside
-#   add_vars using the node id so they flow through to geom_node_label().
-#   geom_edge_label() is used only for the True/False direction label;
-#   the stats are placed via geom_node_label() nudged onto the edge midpoint.
-#
-# Dependencies: partykit, ggparty, ggplot2, scales, rpart, dplyr
+# Dependencies: partykit, ggparty, ggplot2, scales, rpart, dplyr, haven, janitor
 # =============================================================================
 
 
 # ── Install / load packages ───────────────────────────────────────────────────
-install.packages(c("partykit", "ggparty", "ggplot2", "scales", "rpart", "dplyr"))
+# install.packages(c("partykit", "ggparty", "ggplot2", "scales", "rpart",
+#                    "dplyr", "haven", "janitor"))
 library(partykit)
 library(ggparty)
 library(ggplot2)
 library(scales)
 library(rpart)
+library(haven)
 library(dplyr)
+library(janitor)
+
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+df_raw <- read_sas("C:/Users/mmarti06/OneDrive - BCBSMA/Evaluation (Debbie)/Project Work/Medicare Stars/msk_clustering/data/inference_12m_05292026.sas7bdat")
 
 
 # ── Column selection & type coercion ─────────────────────────────────────────
@@ -51,7 +47,7 @@ df <- df_raw %>%
     has_conservative_care,
     has_pt,
     has_inj,
-    has_lifestyle_comorbidity,
+    has_lifestyle_comorb,
     has_acute_care
   ) %>%
   mutate(risk_score_12m = as.numeric(risk_score_12m))
@@ -64,12 +60,12 @@ if (na_count > 0)
 
 # Human-readable labels for split variable names
 label_map <- c(
-  has_pain_general          = "Pain",
-  has_conservative_care     = "Conservative Care",
-  has_pt                    = "Physical Therapy",
-  has_inj                   = "Injections",
-  has_lifestyle_comorbidity = "Lifestyle Comorbidity",
-  has_acute_care            = "Acute Care"
+  has_pain_general      = "Pain",
+  has_conservative_care = "Conservative Care",
+  has_pt                = "Physical Therapy",
+  has_inj               = "Injections",
+  has_lifestyle_comorb  = "Lifestyle Comorbidity",
+  has_acute_care        = "Acute Care"
 )
 
 
@@ -104,21 +100,43 @@ party_tree$data$risk_score_12m <- as.numeric(
 
 
 # ── Route the FULL dataset through the pruned tree ────────────────────────────
-# predict(..., type = "node") assigns each full-sample member to a terminal
-# node using the rpart node numbering. We map these to partykit node IDs and
-# then walk the tree to find which full-sample members pass through every node
-# (terminal AND inner), giving accurate counts for marketing outreach.
-df$rpart_node  <- predict(tree_pruned, newdata = df, type = "node")
+# For regression trees (method = "anova"), rpart does not support
+# predict(..., type = "node"). Instead, we use tree_pruned$where on the
+# training set as a reference, and for new data we use rpart:::pred.rpart
+# indirectly via predict() then match back to nodes.
+#
+# The reliable approach: apply the tree rules directly.
+# rpart stores the frame with node numbers; we use rpart.predict.leaves()
+# equivalent by passing the full df through predict() to get predicted values,
+# then match each prediction to the node-level mean in tree_pruned$frame
+# to recover the rpart node number for each observation.
 
-rpart_terminals <- sort(unique(df$rpart_node))
+# Step 1: get predicted value for every full-sample member
+df_preds <- predict(tree_pruned, newdata = df)
+
+# Step 2: the rpart frame contains the mean prediction ('yval') for each node.
+# Leaf nodes are rows where var == "<leaf>". Match predicted value to leaf yval.
+leaf_frame <- tree_pruned$frame[tree_pruned$frame$var == "<leaf>", ]
+leaf_nodes  <- as.integer(rownames(leaf_frame))
+leaf_yvals  <- leaf_frame$yval
+
+# Each observation's predicted value equals exactly one leaf's yval.
+# Use match() on rounded values to avoid floating-point mismatches.
+df_rpart_node <- leaf_nodes[match(round(df_preds, 10), round(leaf_yvals, 10))]
+
+# Step 3: map rpart leaf node numbers → partykit node IDs.
+# as.party() preserves leaf ordering; party terminal IDs correspond 1-to-1
+# with sorted rpart leaf node numbers.
+rpart_terminals <- sort(unique(df_rpart_node))
 party_terminals <- sort(nodeids(party_tree, terminal = TRUE))
 rpart_to_party  <- setNames(party_terminals, as.character(rpart_terminals))
-df$party_node   <- rpart_to_party[as.character(df$rpart_node)]
+df$party_node   <- rpart_to_party[as.character(df_rpart_node)]
 
 all_node_ids <- nodeids(party_tree)
 
-# For each node, collect full-sample row indices passing through it.
-# Terminal nodes: exact assignment. Inner nodes: union of descendant terminals.
+# Step 4: for each partykit node, collect full-sample row indices routed
+# through it. Terminal nodes: exact match. Inner nodes: union of all
+# descendant terminal nodes' members.
 node_rows <- setNames(
   lapply(all_node_ids, function(nid) {
     desc_terminals <- nodeids(party_tree[[nid]], terminal = TRUE)
@@ -128,7 +146,7 @@ node_rows <- setNames(
 )
 
 
-# ── Helper: stats for a set of row indices ───────────────────────────────────
+# ── Helper: compute stats for a set of row indices ───────────────────────────
 calc_stats <- function(rows) {
   x  <- df$risk_score_12m[rows]
   x  <- x[!is.na(x)]
@@ -151,10 +169,8 @@ all_stats <- lapply(
 
 
 # ── Pre-build display strings keyed by partykit node ID ──────────────────────
-# These named vectors are looked up inside add_vars using the current node's id.
-# This is the only reliable way to get per-node custom strings into both
-# geom_node_label() (for the node boxes) and the edge stat labels (placed via
-# a second geom_node_label() nudged to the edge midpoint — see plot section).
+# Named character vectors looked up in add_vars via node$id (not id(node),
+# which conflicts with the deprecated dplyr::id() function).
 
 fmt_stats <- function(nid) {
   s <- all_stats[[as.character(nid)]]
@@ -169,18 +185,18 @@ node_stat_strings <- setNames(
   as.character(all_node_ids)
 )
 
-# Split variable display names keyed by node id (NA for terminal nodes)
+# Split variable display name for each node (NA for terminals)
 node_splitvar_label <- setNames(
   sapply(all_node_ids, function(nid) {
     sv <- party_tree[[nid]]$node$split$varid
-    if (is.null(sv) || is.na(sv)) return(NA_character_)
+    if (is.null(sv) || length(sv) == 0 || is.na(sv)) return(NA_character_)
     varname <- names(party_tree$data)[sv]
     if (varname %in% names(label_map)) label_map[[varname]] else varname
   }),
   as.character(all_node_ids)
 )
 
-# Root node: full-sample stats (computed directly from df, not tree routing)
+# Root node stats from full sample (all df, independent of tree routing)
 root_x     <- df$risk_score_12m[!is.na(df$risk_score_12m)]
 root_n     <- length(root_x)
 root_mean  <- round(mean(root_x), 3)
@@ -194,10 +210,11 @@ root_stat_str <- paste0(
   "n = ", formatC(root_n, format = "d", big.mark = ",")
 )
 
-# Identify node types
+# Node type sets
 terminal_ids  <- nodeids(party_tree, terminal = TRUE)
 inner_ids     <- setdiff(all_node_ids, terminal_ids)
 nonroot_inner <- setdiff(inner_ids, 1L)
+nonroot_all   <- setdiff(all_node_ids, 1L)
 
 
 # ── Color palette (BCBSMA brand) ──────────────────────────────────────────────
@@ -209,46 +226,33 @@ text_col  <- "#FFFFFF"   # White text on dark backgrounds
 
 
 # ── Build the ggparty plot ────────────────────────────────────────────────────
-#
-# Strategy for edge stats:
-#   geom_edge_label() can only display a single-column aesthetic per edge.
-#   It does NOT have access to add_vars columns.
-#   Instead we use TWO geom_edge_label() calls:
-#     1. True/False direction label (via breaks_label remap)
-#     2. Stats label — injected by pre-computing a "child_stat" string in
-#        add_vars (keyed from the node's own id, which IS available), then
-#        using geom_node_label() nudged upward onto the incoming edge midpoint.
-#   This is the standard workaround for ggparty's edge/node data separation.
+# NOTE: inside add_vars functions, use node$id instead of id(node).
+# dplyr::id() is deprecated and intercepts the partykit id() call, causing
+# the "id() is defunct" error seen when dplyr is loaded alongside partykit.
 
 p <- ggparty(
   party_tree,
   terminal_space = 0.15,
   add_vars = list(
 
-    # For each node, look up the pre-computed stat string
+    # Pre-computed stat string for this node (used in edge stat label)
     node_stat = function(data, node) {
-      node_stat_strings[as.character(id(node))]
+      node_stat_strings[as.character(node$id)]
     },
 
-    # Display label: "All Patients" for root, variable name for other inners,
-    # empty for terminals
+    # Split variable display name for this node
     node_header = function(data, node) {
-      nid <- as.character(id(node))
-      if (id(node) == 1L) {
+      nid <- as.character(node$id)
+      if (node$id == 1L) {
         "All Patients"
-      } else if (id(node) %in% terminal_ids) {
+      } else if (node$id %in% terminal_ids) {
         ""
       } else {
         lbl <- node_splitvar_label[nid]
         if (is.na(lbl)) "" else lbl
       }
-    },
+    }
 
-    # Is this node the root?
-    is_root = function(data, node) id(node) == 1L,
-
-    # Is this node terminal?
-    is_terminal = function(data, node) id(node) %in% terminal_ids
   )
 ) +
 
@@ -256,8 +260,8 @@ p <- ggparty(
   geom_edge(color = "#00A3E0", linewidth = 0.7) +
 
   # ── Edge direction labels: True / False ──────────────────────────────────────
-  # parse = FALSE prevents ggparty from trying to parse our custom label as an
-  # R expression (which would break the newline and bracket characters).
+  # parse = FALSE: prevents ggparty from interpreting our label as an R
+  # expression, which would corrupt the text.
   geom_edge_label(
     aes(
       label = ifelse(
@@ -273,17 +277,17 @@ p <- ggparty(
     label.padding = unit(0.25, "lines"),
     label.r       = unit(0.12, "lines"),
     label.size    = 0.3,
-    shift         = 0.3    # place closer to parent node so stats fit below
+    shift         = 0.28   # closer to parent node; stats label sits below this
   ) +
 
-  # ── Edge stat labels: mean, CI, n — placed near midpoint via node nudge ──────
-  # These are placed at each NON-ROOT node position and nudged upward along the
-  # incoming edge. We target all non-root nodes (inner + terminal) so every
-  # branch gets annotated. shift = 0.65 moves the label 65% of the way from
-  # child toward parent, placing it on the lower half of each edge.
+  # ── Edge stat labels: mean (95% CI) and n ────────────────────────────────────
+  # geom_edge_label() does not have access to add_vars. The workaround:
+  # use a second geom_edge_label() and reference node_stat via the `id`
+  # aesthetic — which in edge context maps to the CHILD node id, matching
+  # the keys in our node_stat_strings named vector.
   geom_edge_label(
-    aes(label = node_stat[as.character(id)]),
-    ids           = setdiff(all_node_ids, 1L),   # all nodes except root
+    aes(label = node_stat_strings[as.character(id)]),
+    ids           = nonroot_all,
     parse         = FALSE,
     color         = edge_col,
     size          = 2.8,
@@ -292,10 +296,10 @@ p <- ggparty(
     label.padding = unit(0.3, "lines"),
     label.r       = unit(0.12, "lines"),
     label.size    = 0.3,
-    shift         = 0.68   # lower portion of edge, below the True/False label
+    shift         = 0.68   # lower half of edge, below the True/False label
   ) +
 
-  # ── Root node: "All Patients" (orange) ───────────────────────────────────────
+  # ── Root node: "All Patients" orange box ─────────────────────────────────────
   geom_node_label(
     aes(label = paste0("All Patients\n", root_stat_str)),
     ids           = 1L,
@@ -308,7 +312,7 @@ p <- ggparty(
     label.col     = root_bg
   ) +
 
-  # ── Non-root inner split nodes: variable name only (dark navy) ───────────────
+  # ── Non-root inner nodes: split variable name only ───────────────────────────
   geom_node_label(
     aes(label = ifelse(
       is.na(node_splitvar_label[as.character(id)]),
@@ -325,9 +329,7 @@ p <- ggparty(
     label.col     = node_bg
   ) +
 
-  # ── Terminal nodes: render as invisible point so ggparty doesn't draw boxes ──
-  # ggparty always reserves space for terminal nodes. Setting fill and color
-  # to the background color and using a tiny label makes them invisible.
+  # ── Terminal nodes: invisible (background-coloured, no border) ───────────────
   geom_node_label(
     aes(label = ""),
     ids           = terminal_ids,
