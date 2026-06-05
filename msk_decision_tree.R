@@ -9,17 +9,16 @@
 #                     minimum the seven columns selected below.
 # Outputs:  decision_tree_msk_ggparty.png  (14 × 9 in, 300 dpi)
 #
-# Dependencies: partykit, ggparty, ggplot2, scales, patchwork, rpart
+# Dependencies: partykit, ggparty, ggplot2, scales, rpart
 # =============================================================================
 
 
 # ── Install / load packages ───────────────────────────────────────────────────
-install.packages(c("partykit", "ggparty", "ggplot2", "scales", "patchwork"))
+install.packages(c("partykit", "ggparty", "ggplot2", "scales", "rpart"))
 library(partykit)   # Tree objects and node utilities
 library(ggparty)    # ggplot2 extension for decision tree visualisation
 library(ggplot2)    # Core plotting
-library(scales)     # Axis label formatting (label_number)
-library(patchwork)  # Plot composition (available if multi-panel layout needed)
+library(scales)     # Axis label formatting
 library(rpart)      # Recursive partitioning — fits the regression tree
 
 
@@ -28,19 +27,17 @@ library(rpart)      # Recursive partitioning — fits the regression tree
 # Clean names avoid formula-quoting issues in rpart() and downstream code.
 df <- df_raw %>%
   select(
-    risk_score_12m,           # Outcome: continuous MSK risk score at 12 months
-    has_pain_general,         # Binary: any general pain diagnosis
-    has_conservative_care,    # Binary: conservative care utilisation flag
-    has_pt,                   # Binary: physical therapy utilisation flag
-    has_inj,                  # Binary: injection utilisation flag
-    has_lifestyle_comorbidity,# Binary: lifestyle-related comorbidity present
-    has_acute_care            # Binary: acute care utilisation flag
+    risk_score_12m,            # Outcome: continuous MSK risk score at 12 months
+    has_pain_general,          # Binary: any general pain diagnosis
+    has_conservative_care,     # Binary: conservative care utilisation flag
+    has_pt,                    # Binary: physical therapy utilisation flag
+    has_inj,                   # Binary: injection utilisation flag
+    has_lifestyle_comorbidity, # Binary: lifestyle-related comorbidity present
+    has_acute_care             # Binary: acute care utilisation flag
   ) %>%
   mutate(
     # risk_score_12m arrives as character in the source data; coerce to numeric
     # here so rpart(), partykit, and all plot code receive the correct type.
-    # The as.numeric(as.character(...)) guards downstream are kept as a safety
-    # net in case the source type changes again, but this is now the fix.
     risk_score_12m = as.numeric(risk_score_12m)
   )
 
@@ -74,9 +71,9 @@ test  <- df[-train_idx, ]
 
 # ── Fit regression tree ───────────────────────────────────────────────────────
 # maxdepth = 4  : caps complexity to four levels, improving interpretability.
-# minsplit  = 30: a node must have ≥ 30 observations before attempting a split.
-# cp        = 0.005: complexity parameter — splits that don't improve R² by at
-#             least 0.5 % are not attempted, preventing trivial branches.
+# minsplit  = 30: a node must have >= 30 observations before attempting a split.
+# cp        = 0.005: complexity parameter — splits that don't improve R^2 by at
+#             least 0.5% are not attempted, preventing trivial branches.
 tree_model <- rpart(
   risk_score_12m ~ .,
   data    = train,
@@ -100,34 +97,11 @@ tree_pruned <- prune(tree_model, cp = best_cp)
 # ── Convert to partykit format ────────────────────────────────────────────────
 # as.party() wraps the rpart object in the partykit representation required by
 # ggparty for plotting; node data and split information are preserved.
-# NOTE: as.party() re-encodes the numeric outcome as a factor in node data
-# slots. A patching loop immediately below restores it to numeric so that
-# geom_node_plot and node_means both receive the correct type.
 party_tree <- as.party(tree_pruned)
 
-# ── Patch top-level data back to numeric ─────────────────────────────────────
-# as.party() can re-encode the numeric outcome as a factor in party_tree$data,
-# which is the data slot geom_node_plot slices per-node when building leaf plots.
+# as.party() can re-encode the numeric outcome as a factor in party_tree$data.
 # A single coercion on the top-level $data slot fixes it for all nodes at once.
 party_tree$data$risk_score_12m <- as.numeric(as.character(party_tree$data$risk_score_12m))
-
-
-# ── Pre-compute terminal node means ──────────────────────────────────────────
-# nodeapply() cannot be called inside aes() because `id` is a ggplot aesthetic
-# variable, not an R object available at expression-build time. Instead, build
-# a named numeric vector keyed by node ID here, then look it up inside aes()
-# using the vectorised `node_means[as.character(id)]` pattern.
-terminal_ids <- nodeids(party_tree, terminal = TRUE)
-node_means   <- setNames(
-  sapply(terminal_ids, function(i)
-    # as.numeric(as.character()) is required: as.party() stores the outcome as
-    # a factor in node$data. Plain as.numeric() returns factor level codes
-    # (integers like 6051), not the original probability values. Converting
-    # factor → character → numeric recovers the true 0–1 probability.
-    mean(as.numeric(as.character(party_tree[[i]]$data$risk_score_12m)), na.rm = TRUE)
-  ),
-  as.character(terminal_ids)
-)
 
 
 # ── Build the ggparty visualisation ──────────────────────────────────────────
@@ -136,22 +110,62 @@ node_means   <- setNames(
 #   Light Blue    #00A3E0 — bright cyan-blue, used for CTAs and highlights
 #   Orange        #F47920 — warm accent orange, used for buttons and callouts
 #   Dark Navy     #003366 — deep background blue
-#
-# Histogram gradient runs BCBSMA light blue (low risk) → BCBSMA orange (high risk).
-# Inner node labels use the dark navy background with white text.
-risk_low  <- "#00A3E0"   # BCBSMA Light Blue — low-risk end of histogram gradient
-risk_high <- "#F47920"   # BCBSMA Orange     — high-risk end of histogram gradient
-node_bg   <- "#003366"   # BCBSMA Dark Navy  — inner node label background
-text_col  <- "#FFFFFF"   # White text on dark node labels
+node_bg  <- "#003366"   # BCBSMA Dark Navy  — inner node label background
+text_col <- "#FFFFFF"   # White text on dark node labels
 
-p <- ggparty(party_tree, terminal_space = 0.35) +
+# ── add_vars: compute mean, 95% CI bounds, and n for every node ───────────────
+# ggparty's add_vars argument accepts named functions of the form
+# function(data, node). They are evaluated once per node at plot-build time,
+# making the results available as columns inside any aes() call.
+# qt(0.975, df) gives the t critical value for a two-sided 95% CI.
+# The as.numeric(as.character()) coercion is retained as a safety net because
+# as.party() may store risk_score_12m as a factor in per-node $data slots even
+# after the top-level $data patch above.
+p <- ggparty(
+  party_tree,
+  terminal_space = 0.2,
+  add_vars = list(
 
-  # ── Tree edges ─────────────────────────────────────────────────────────────
+    node_mean = function(data, node) {
+      x <- as.numeric(as.character(node$data$risk_score_12m))
+      round(mean(x, na.rm = TRUE), 3)
+    },
+
+    node_ci_lo = function(data, node) {
+      x  <- as.numeric(as.character(node$data$risk_score_12m))
+      n  <- sum(!is.na(x))
+      se <- sd(x, na.rm = TRUE) / sqrt(n)
+      round(mean(x, na.rm = TRUE) - qt(0.975, df = n - 1) * se, 3)
+    },
+
+    node_ci_hi = function(data, node) {
+      x  <- as.numeric(as.character(node$data$risk_score_12m))
+      n  <- sum(!is.na(x))
+      se <- sd(x, na.rm = TRUE) / sqrt(n)
+      round(mean(x, na.rm = TRUE) + qt(0.975, df = n - 1) * se, 3)
+    },
+
+    node_n = function(data, node) {
+      sum(!is.na(as.numeric(as.character(node$data$risk_score_12m))))
+    }
+
+  )
+) +
+
+  # ── Tree edges ───────────────────────────────────────────────────────────────
   geom_edge(color = "#00A3E0", linewidth = 0.7) +
 
-  # Edge labels: show the Yes/No or factor-level break values at each branch.
+  # ── Edge labels: True / False instead of >= 0.5 / < 0.5 ────────────────────
+  # All predictors are binary (0/1). rpart splits them at 0.5, producing the
+  # breaks_label values "< 0.5" (i.e. 0 = False) and ">= 0.5" (i.e. 1 = True).
+  # The ifelse() remaps these to human-readable True/False labels.
   geom_edge_label(
-    aes(label = breaks_label),
+    aes(
+      label = ifelse(
+        grepl(">=", breaks_label), "True",
+        ifelse(grepl("<",  breaks_label), "False", breaks_label)
+      )
+    ),
     color         = "#0057A8",
     size          = 3.2,
     fontface      = "bold",
@@ -160,75 +174,54 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
     label.r       = unit(0.15, "lines")
   ) +
 
-  # ── Inner node labels: show the splitting variable name ────────────────────
-  # label_map translates raw column names (e.g. "has_pt") to readable labels
-  # (e.g. "Physical Therapy"). ifelse guards nodes where splitvar is NA (roots
-  # of single-node trees) though in practice all inner nodes have a splitvar.
+  # ── Inner node labels: variable name + mean (95% CI) + n ────────────────────
+  # geom_node_label()'s line_list argument accepts one aes() per line of text;
+  # line_gpar sets font size, color, and style for each line independently.
+  # The three stats (mean, CI, n) are pre-computed via add_vars above and are
+  # available here by their names as ggparty data columns.
   geom_node_label(
-    aes(label = ifelse(is.na(splitvar), "",
-                       label_map[splitvar])),
-    ids           = "inner",
-    color         = text_col,
+    ids       = "inner",
+    line_list = list(
+      # Line 1: human-readable variable name from label_map
+      aes(label = ifelse(is.na(splitvar), "", label_map[splitvar])),
+      # Line 2: mean risk score with 95% confidence interval
+      aes(label = paste0("\u03bc = ", node_mean,
+                         "  [", node_ci_lo, ", ", node_ci_hi, "]")),
+      # Line 3: sample size at this node
+      aes(label = paste0("n = ", formatC(node_n, format = "d", big.mark = ",")))
+    ),
+    line_gpar = list(
+      list(size = 10, col = text_col, fontface = "bold"),   # variable name
+      list(size =  8, col = "#A8C8E8", fontface = "plain"), # mean + CI
+      list(size =  8, col = "#A8C8E8", fontface = "plain")  # n
+    ),
     fill          = node_bg,
-    size          = 3.5,
-    fontface      = "bold",
-    label.padding = unit(0.4, "lines"),
-    label.r       = unit(0.2, "lines")
+    label.padding = unit(0.45, "lines"),
+    label.r       = unit(0.2,  "lines"),
+    label.col     = node_bg
   ) +
 
-  # ── Terminal node plots: mini histogram of risk score distribution ──────────
-  # Each leaf node embeds a small histogram so the reader can see not just the
-  # mean risk score but the full distribution within that patient segment.
-  geom_node_plot(
-    gglist = list(
-      geom_histogram(
-        # geom_node_plot passes each node's data slice to ggplot() directly.
-        # The .data pronoun and wrapper functions like as.numeric(as.character(...))
-        # are evaluated *before* the data is attached, causing "object not found".
-        # Fix: use a plain aes() with the bare column name. The numeric coercion
-        # is handled upstream in the df mutate() and the as.party() conversion;
-        # by this point risk_score_12m is already numeric in the node data.
-        aes(x = risk_score_12m, fill = after_stat(x)),
-        bins      = 15,
-        color     = "white",
-        linewidth = 0.2
-      ),
-      scale_fill_gradient(low = risk_low, high = risk_high, guide = "none"),
-      scale_x_continuous(limits = c(0, 1), labels = label_number(accuracy = 0.01)),
-      scale_y_continuous(labels = NULL),
-      theme_minimal(base_family = "sans"),
-      theme(
-        panel.grid  = element_blank(),
-        axis.title  = element_blank(),
-        axis.text.y = element_blank(),
-        axis.text.x = element_text(size = 6, color = "#0057A8"),
-        plot.margin = margin(2, 2, 2, 2)
-      )
-    ),
-    shared_axis_labels = TRUE,
-    height = 0.25,
-    width  = 0.9
-  ) +
-
-  # ── Terminal node labels: mean risk score (μ) for each leaf ────────────────
-  # node_means is a named vector (keyed by node ID as character) pre-computed
-  # above. Looking it up with node_means[as.character(id)] is safe inside aes()
-  # because the entire vector is available in the enclosing environment.
+  # ── Terminal node labels: mean (95% CI) + n ──────────────────────────────────
+  # Terminal nodes receive the same stats layout but without a variable name,
+  # styled in BCBSMA light blue on a pale background for visual contrast.
   geom_node_label(
-    aes(
-      label = paste0("\u03bc = ", round(node_means[as.character(id)], 3))
+    ids       = "terminal",
+    line_list = list(
+      aes(label = paste0("\u03bc = ", node_mean,
+                         "  [", node_ci_lo, ", ", node_ci_hi, "]")),
+      aes(label = paste0("n = ", formatC(node_n, format = "d", big.mark = ",")))
     ),
-    ids           = "terminal",
-    color         = "#0057A8",
+    line_gpar = list(
+      list(size = 8, col = "#0057A8", fontface = "plain"),
+      list(size = 8, col = "#0057A8", fontface = "plain")
+    ),
     fill          = "#E8F4FB",
-    size          = 3,
-    fontface      = "italic",
-    nudge_y       = 0.06,    # positive = above the histogram, not overlapping it
-    label.padding = unit(0.25, "lines"),
-    label.r       = unit(0.15, "lines")
+    label.padding = unit(0.4,  "lines"),
+    label.r       = unit(0.15, "lines"),
+    label.col     = "#BDD9EF"
   ) +
 
-  # ── Overall plot theme & titles ────────────────────────────────────────────
+  # ── Overall plot theme & titles ───────────────────────────────────────────────
   theme_void(base_family = "sans") +
   theme(
     plot.background = element_rect(fill = "#F0F8FF", color = NA),
@@ -241,8 +234,8 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
   ) +
   labs(
     title    = "Predictors of 12-Month MSK Risk Score",
-    subtitle = "Regression tree · each leaf shows risk score distribution and mean",
-    caption  = "Pruned via 1-SE rule · trained on 80% holdout"
+    subtitle = "Regression tree \u00b7 each node shows mean risk score (95% CI) and sample size",
+    caption  = "Pruned via 1-SE rule \u00b7 trained on 80% holdout"
   )
 
 
