@@ -100,11 +100,16 @@ tree_pruned <- prune(tree_model, cp = best_cp)
 # ── Convert to partykit format ────────────────────────────────────────────────
 # as.party() wraps the rpart object in the partykit representation required by
 # ggparty for plotting; node data and split information are preserved.
-# NOTE: as.party() can silently coerce the numeric outcome to a factor in node
-# data slots. node_means uses as.numeric(as.character()) to recover true values.
-# geom_node_plot receives numeric data because risk_score_12m is coerced above
-# in the df mutate(); plain aes(x = risk_score_12m) works fine in that context.
+# NOTE: as.party() re-encodes the numeric outcome as a factor in node data
+# slots. A patching loop immediately below restores it to numeric so that
+# geom_node_plot and node_means both receive the correct type.
 party_tree <- as.party(tree_pruned)
+
+# ── Patch top-level data back to numeric ─────────────────────────────────────
+# as.party() can re-encode the numeric outcome as a factor in party_tree$data,
+# which is the data slot geom_node_plot slices per-node when building leaf plots.
+# A single coercion on the top-level $data slot fixes it for all nodes at once.
+party_tree$data$risk_score_12m <- as.numeric(as.character(party_tree$data$risk_score_12m))
 
 
 # ── Pre-compute terminal node means ──────────────────────────────────────────
