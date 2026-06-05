@@ -101,8 +101,9 @@ tree_pruned <- prune(tree_model, cp = best_cp)
 # as.party() wraps the rpart object in the partykit representation required by
 # ggparty for plotting; node data and split information are preserved.
 # NOTE: as.party() can silently coerce the numeric outcome to a factor in node
-# data slots. All downstream uses of risk_score_12m call as.numeric() explicitly
-# as a guard — see node_means and geom_histogram aes() below.
+# data slots. node_means uses as.numeric(as.character()) to recover true values.
+# geom_node_plot receives numeric data because risk_score_12m is coerced above
+# in the df mutate(); plain aes(x = risk_score_12m) works fine in that context.
 party_tree <- as.party(tree_pruned)
 
 
@@ -176,12 +177,13 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
   geom_node_plot(
     gglist = list(
       geom_histogram(
-        # .data[["risk_score_12m"]] uses the tidy eval pronoun to explicitly
-        # reference the column from the node's data frame passed by geom_node_plot.
-        # Plain aes(x = risk_score_12m) fails here because the gglist is evaluated
-        # in a new scope where the column name cannot be resolved by lazy lookup.
-        aes(x = as.numeric(as.character(.data[["risk_score_12m"]])),
-            fill = after_stat(x)),
+        # geom_node_plot passes each node's data slice to ggplot() directly.
+        # The .data pronoun and wrapper functions like as.numeric(as.character(...))
+        # are evaluated *before* the data is attached, causing "object not found".
+        # Fix: use a plain aes() with the bare column name. The numeric coercion
+        # is handled upstream in the df mutate() and the as.party() conversion;
+        # by this point risk_score_12m is already numeric in the node data.
+        aes(x = risk_score_12m, fill = after_stat(x)),
         bins      = 15,
         color     = "white",
         linewidth = 0.2
