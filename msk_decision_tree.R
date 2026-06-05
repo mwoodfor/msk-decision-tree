@@ -176,9 +176,12 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
   geom_node_plot(
     gglist = list(
       geom_histogram(
-        # as.numeric(as.character()) is required — see node_means comment above.
-        # Plain as.numeric() on a factor returns level codes, not probabilities.
-        aes(x = as.numeric(as.character(risk_score_12m)), fill = after_stat(x)),
+        # .data[["risk_score_12m"]] uses the tidy eval pronoun to explicitly
+        # reference the column from the node's data frame passed by geom_node_plot.
+        # Plain aes(x = risk_score_12m) fails here because the gglist is evaluated
+        # in a new scope where the column name cannot be resolved by lazy lookup.
+        aes(x = as.numeric(as.character(.data[["risk_score_12m"]])),
+            fill = after_stat(x)),
         bins      = 15,
         color     = "white",
         linewidth = 0.2
