@@ -84,6 +84,9 @@ tree_pruned <- prune(tree_model, cp = best_cp)
 # ── Convert to partykit format ────────────────────────────────────────────────
 # as.party() wraps the rpart object in the partykit representation required by
 # ggparty for plotting; node data and split information are preserved.
+# NOTE: as.party() can silently coerce the numeric outcome to a factor in node
+# data slots. All downstream uses of risk_score_12m call as.numeric() explicitly
+# as a guard — see node_means and geom_histogram aes() below.
 party_tree <- as.party(tree_pruned)
 
 
@@ -95,7 +98,7 @@ party_tree <- as.party(tree_pruned)
 terminal_ids <- nodeids(party_tree, terminal = TRUE)
 node_means   <- setNames(
   sapply(terminal_ids, function(i)
-    mean(party_tree[[i]]$data$risk_score_12m, na.rm = TRUE)
+    mean(as.numeric(party_tree[[i]]$data$risk_score_12m), na.rm = TRUE)
   ),
   as.character(terminal_ids)
 )
@@ -149,7 +152,9 @@ p <- ggparty(party_tree, terminal_space = 0.35) +
   geom_node_plot(
     gglist = list(
       geom_histogram(
-        aes(x = risk_score_12m, fill = after_stat(x)),
+        # as.numeric() guards against risk_score_12m being coerced to a factor
+        # when rpart node data is converted to the partykit representation.
+        aes(x = as.numeric(risk_score_12m), fill = after_stat(x)),
         bins      = 15,
         color     = "white",
         linewidth = 0.2
